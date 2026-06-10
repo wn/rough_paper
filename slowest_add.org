@@ -1,0 +1,263 @@
+#+title: Summing numbers as slow as possible
+#+date: <2026-06-07 Sun>
+#+hugo_weight: 2
+#+hugo_draft: true
+
+Given a bunch of integers laid out consecutively in memory, how can we sum them up as slowly as possible? We could add the numbers from left to right (~data[0] + data[1] + ...~) or we could add the numbers randomly (~data[67] + data[69420] + data[42] + ...~). In this post, we are going to figure out what ordering of summing up the numbers would take the longest.
+
+First and foremost, lets set some rules:
+- Useless function calls are not allowed. (eg adding ~sleep~ or ~mutex~).
+- The accumulation function will be as such and we are only allowed to change the contents of ~positions~:
+  #+begin_src C
+uint32_t accumulator(uint32_t const* data, uint32_t const* positions) {
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t pos = positions[i];
+        total += data[pos];
+    }
+    return total;
+}
+  #+end_src
+- We are summing up 2^26 integers. This means we will use 65536 pages.
+
+Some additional notes:
+- I am writing this blog on emacs, referring to google-chrome and browsing reddit; all while running the performance measurements, so noises from the results are expected.
+- Compiled and ran with ~gcc slowest.c -O3 && taskset -c 3 ./a.out~. This runs the binary on Core 3 of my CPU.
+- All measurements will be based on my machine:
+  #+begin_src shell
+❯ lscpu
+Architecture:                x86_64
+  CPU op-mode(s):            32-bit, 64-bit
+  Address sizes:             42 bits physical, 48 bits virtual
+  Byte Order:                Little Endian
+CPU(s):                      8
+  On-line CPU(s) list:       0-7
+Vendor ID:                   GenuineIntel
+  Model name:                Intel(R) Core(TM) Ultra 7 268V
+    CPU family:              6
+    Model:                   189
+    Thread(s) per core:      1
+    Core(s) per socket:      8
+    Socket(s):               1
+    Stepping:                1
+    CPU(s) scaling MHz:      50%
+    CPU max MHz:             2200.0000
+    CPU min MHz:             400.0000
+    BogoMIPS:                6604.80
+    Flags:                   ...
+Virtualization features:
+  Virtualization:            VT-x
+Caches (sum of all):
+  L1d:                       320 KiB (8 instances)
+  L1i:                       512 KiB (8 instances)
+  L2:                        14 MiB (5 instances)
+  L3:                        12 MiB (1 instance)
+NUMA:
+...
+Vulnerabilities:
+...
+  #+end_src
+
+-----
+The full C code can be found here, and all the scripts I used is in my github repo. TODO
+-----
+Our job is to find the permutation of ~positions~ that yields the slowest possible timing. Lets begin by the simplest access pattern:
+  #+begin_src C
+void linear(uint32_t* positions) {
+    for (uint32_t i = 0; i < count; ++i) {
+        positions[i] = i;
+    }
+}
+  #+end_src
+You could think of this as the permutation that probably runs the fastest. In fact, this took us 1.51G (1505606726) cycles. This is expected, since our CPU was designed based on data that will be access in a contiguous fashion. This means we can only do worse from here on.
+
+On the other side of the spectrum, we could randomize the permutation of ~positions~.
+#+begin_src C
+void fisher_yates_shuffle(uint32_t* positions) {
+    linear(positions);
+    uint32_t remaining = count;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t random = rand() % remaining;
+        uint32_t tmp = positions[i];
+        positions[i] = positions[i + random];
+        positions[i + random] = tmp;
+        --remaining;
+    }
+}
+#+end_src
+This means that our CPU cannot predict what it will access next. As expected, randomized access takes 8.74G cycles, almost 6x worse than what we did with our linear access. Could we do any worse? Of course we can, but lets build up our worse permutation. starting with a simple regression.
+
+Set positions such that every consecutive elements accessed is almost always separated by a cache line, which is the unit of data that is stored in a cache:
+#+begin_src C
+void separated_by_a_cacheline(uint32_t* positions) {
+    linear(positions);
+    constexpr int element_count_per_cacheline = CACHELINE_SIZE / sizeof(uint32_t);
+    constexpr int cacheline_count = count / element_count_per_cacheline;
+    static_assert(count % element_count_per_cacheline == 0);
+    int current = 0;
+    for (int element_index = 0; element_index < element_count_per_cacheline; ++element_index) {
+        for (int cacheline_index = 0; cacheline_index < cacheline_count; ++cacheline_index) {
+            positions[current] = cacheline_index * element_count_per_cacheline + element_index;
+            ++current;
+        }
+    }
+}
+#+end_src
+This pattern is terrible because we are forcing our CPU to fetch a 64 bytes cacheline just to service 4 bytes of data. We see that horrible performance with a cycle count of 2.29G, 50% worse than the linear scan.
+
+When accessing elements separated by a cacheline, the memory controller recognises our ~data~ access pattern. The hardware (HW) prefetcher can start fetching the next cache line into the L2 cache even before it is being requested. However, a drawback of the HW prefetcher is that it does not [[https://community.intel.com/t5/Intel-Moderncode-for-Parallel/Multidimensional-Transpose-Prefetching/m-p/1050948#M6795][prefetch across pages]]. I am guessing that the reason is that the HW prefetcher  works with physical addresses, and while we are accessing consecutive virtual memory addresses, it does not mean that the physical addresses will also be consecutive.
+
+So instead of only separating our access by a cacheline, we separate it by a full page instead. Each page is 4096 bytes, and our code looks as follows:
+#+begin_src C
+void separated_by_a_page(uint32_t* positions) {
+    linear(positions);
+    constexpr int element_count_per_page = PAGE_SIZE / sizeof(uint32_t);
+    constexpr int page_count = count / element_count_per_page;
+    static_assert(count % element_count_per_page == 0);
+    int current = 0;
+    for (int element_index = 0; element_index < element_count_per_page; ++element_index) {
+        for (int page_index = 0; page_index < page_count; ++page_index) {
+            positions[current] = page_index * element_count_per_page + element_index;
+            ++current;
+        }
+    }
+}
+#+end_src
+There is a significant regression to 7.83G cycles.
+
+If you have been paying attention, you will notice that our access pattern looks like this:
+#+begin_src
+page 0, cacheline 0, elem 0
+page 1, cacheline 0, elem 0
+page 2, cacheline 0, elem 0
+...
+page 65534, cacheline 0, elem 0
+page 65535, cacheline 0, elem 0
+page 0, cacheline 0, elem 1
+page 1, cacheline 0, elem 1
+page 2, cacheline 0, elem 1
+#+end_src
+After accessing 65536 cacheline, we go back to the same cacheline. We say that our cacheline-reusing distance (a term that I made up) is 65536 (we access the same cacheline after making 65536 accesses). We can do worse by not repeating cacheline, or can we not?
+#+begin_src C
+void separated_by_a_page_and_cacheline(uint32_t* positions) {
+    linear(positions);
+    constexpr int elements_per_cacheline = CACHELINE_SIZE / sizeof(uint32_t);
+    constexpr int elements_per_page = PAGE_SIZE / sizeof(uint32_t);
+    constexpr int cacheline_per_page = PAGE_SIZE / CACHELINE_SIZE;
+    constexpr int page_count = count / elements_per_page;
+
+    static_assert(count % elements_per_page == 0);
+
+    int current = 0;
+    for (int element_index_in_cacheline = 0; element_index_in_cacheline < elements_per_cacheline; ++element_index_in_cacheline) {
+        for (int cacheline_index_in_page = 0; cacheline_index_in_page < cacheline_per_page; ++cacheline_index_in_page) {
+            for (int page_index = 0; page_index < page_count; ++page_index) {
+                positions[current++] = page_index * elements_per_page + cacheline_index_in_page * elements_per_cacheline + element_index_in_cacheline;
+            }
+        }
+    }
+}
+#+end_src
+Hmm, we get a cycle count of 7.87G, which is strange since we don't see any regression. Why is that so?
+#+begin_src
+❯ lstopo
+Machine (31GB total)
+  Package L#0
+    NUMANode L#0 (P#0 31GB)
+    L3 L#0 (12MB)
+      L2 L#0 (2560KB) + L1d L#0 (48KB) + L1i L#0 (64KB) + Core L#0 + PU L#0 (P#0)
+      L2 L#1 (2560KB) + L1d L#1 (48KB) + L1i L#1 (64KB) + Core L#1 + PU L#1 (P#1)
+      L2 L#2 (2560KB) + L1d L#2 (48KB) + L1i L#2 (64KB) + Core L#2 + PU L#2 (P#2)
+      L2 L#3 (2560KB) + L1d L#3 (48KB) + L1i L#3 (64KB) + Core L#3 + PU L#3 (P#3)
+    L2 L#4 (4096KB)
+      L1d L#4 (32KB) + L1i L#4 (64KB) + Core L#4 + PU L#4 (P#4)
+      L1d L#5 (32KB) + L1i L#5 (64KB) + Core L#5 + PU L#5 (P#5)
+      L1d L#6 (32KB) + L1i L#6 (64KB) + Core L#6 + PU L#6 (P#6)
+      L1d L#7 (32KB) + L1i L#7 (64KB) + Core L#7 + PU L#7 (P#7)
+  HostBridge
+    PCI 00:02.0 (VGA)
+    PCI 00:0b.0 (ProcessingAccelerator)
+    PCI 00:14.3 (Network)
+      Net "wlp0s20f3"
+    PCIBridge
+      PCI 04:00.0 (NVMExp)
+        Block(Disk) "nvme0n1"
+
+#+end_src
+Despite a higher cacheline-reusing distance of 4M (PAGE_COUNT * PAGE_SIZE / CACHELINE_SIZE) We are using core 3, and ~L2 L#3 (2560KB) + L1d L#3 (48KB) + L1i L#3 (64KB) + Core L#3 + PU L#3 (P#3)~ indicates that it is provided with 2.5MB of L2 cache and 48KB of L1 cache. After iterating through 65536 pages, we accessed 4MB of data. This means that we can't reuse the cacheline. Reusing cacheline don't yield better perforance if the cache line is evicted before reuse. In our case, we should see improvements if our cacheline-reuse distance is <40 thousand (2560+48)*1024/64).
+
+We have been separating our access stride by a single page. Instead, lets separate it by N pages.
+#+begin_src C
+void separated_by_stride_pages_and_cacheline(uint32_t* positions) {
+    linear(positions);
+    constexpr int elements_per_cacheline = CACHELINE_SIZE / sizeof(uint32_t);
+    constexpr int elements_per_page = PAGE_SIZE / sizeof(uint32_t);
+    constexpr int cacheline_per_page = PAGE_SIZE / CACHELINE_SIZE;
+    constexpr int page_count = count / elements_per_page;
+
+    constexpr int page_stride = STRIDE;
+
+    static_assert(count % elements_per_page == 0);
+    static_assert(page_stride > 0);
+
+    int current = 0;
+    for (int element_index_in_cacheline = 0; element_index_in_cacheline < elements_per_cacheline; ++element_index_in_cacheline) {
+        for (int cacheline_index_in_page = 0; cacheline_index_in_page < cacheline_per_page; ++cacheline_index_in_page) {
+            for (int page_start = 0; page_start < page_stride && page_start < page_count; ++page_start) {
+                for (int page_index = page_start; page_index < page_count; page_index += page_stride) {
+                    positions[current++] = page_index * elements_per_page + cacheline_index_in_page * elements_per_cacheline + element_index_in_cacheline;
+                }
+            }
+        }
+    }
+}
+#+end_src
+#+begin_src
+page 0, cacheline 0, elem 0
+page N, cacheline 0, elem 0
+page 2N, cacheline 0, elem 0
+...
+page 0, cacheline 1, elem 0
+page N, cacheline 1, elem 0
+page 2N, cacheline 1, elem 0
+...
+#+end_src
+
+And instead of running it for a specific N, we plot a graph of cycles against page stride:
+
+#+begin_export hugo
+{{< interactive-svg src="/posts/img/sum_int_stride.svg" title="Stride benchmark graph" ratio="11 / 6" >}}
+#+end_export
+
+An access stride of 8 pages gives us the worse possible result of 10.3G cycles. There are many different memory access effects happening in the graph, where more is discussed in the appendix section. But the reason for the peak cycle count when the stride distance of 8 is because of how we are accessing the pages, or as the cool kids call it, page-walking.
+
+When accessing an a memory, you are actually trying to access the virtual memory address's data. The memory management unit (MMU) is in charge of translating the virtual memory address to the physical memory address. Most introduction Operating System (OS) classes would have covered this so we won't be explaining it here. What we are interested here is a specific data structure used by the MMU called the page table entry (PTE). This stores the physical page frame number that corresponds to the virtual page, together with flags and other metadata. This PTE is 8 bytes, meaning a cache line could store 8 PTE. With a access stride of 8 pages, I believe that the dorminant effect is this - instead of just accesing a new cacheline to fetch thet data every time we make an access, we now fetch an additional one via page-walking. This in fact, is slower than summing up numbers from random indices.
+
+But we are not done yet. We've saturated our cache. We've destroyed the HW prefetcher. We've stop reusing cacheline. And we've pushed our MMU to the brink by making it "walk" on every access. One last thing we are going to do is to screw with the *RAM controller*.
+
+<TODO talk about how RAM access works>
+
+Closing notes:
+- despite us trying to make our code slower, I hope that readers learnt something about how memory works!
+- if you like reading articles, you might be interested [[https://highload.fun/challenges/compute/parse_integers/leaderboard][a problem on highload.fun]], which inspired this post.
+- none of this would be possible without [[https://github.com/zielaj/][zielaj]], who graciously [[https://highload.fun/articles/parse-integers-task-memory-access-pattern/detail][shared how to speed up RAM access]] for the above problem.
+- one of you buggers out there is sure to find a slower access pattern and if so, let me know!
+- discussions is always appreciated. Here is the lobste.rs, hacker news, and reddit thread.
+-----
+  #+begin_src shell
+perf stat -x, -r 3 -e \
+    cpu_core/cycles/,\
+    cpu_core/instructions/,\
+    cpu_core/dtlb_load_misses.walk_completed/,\
+    cpu_core/dtlb_load_misses.walk_pending/,\
+    cpu_core/dtlb_load_misses.stlb_hit/,\
+    cpu_core/cache-misses/,\
+    cpu_core/memory_stalls.mem/,\
+    cpu_core/mem_load_retired.l3_miss/ \
+    taskset -c 3 /tmp/stride47
+  #+end_src
+
+  - zigzag pattern is due to cache aliasing, same as 32 and 64.
+  - increasing 1-8 because of PTE
+  - decreasing because cacheline-reuse dist will decrease
+  - 32 and 64 is due to cache trashing
