@@ -9,13 +9,21 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Sweep STRIDE=1..100 once per run, repeating the full sweep 5 times."
     )
-    parser.add_argument("--source", default="slowest.c", help="C++ source file to compile")
-    parser.add_argument("--output", default="result.txt", help="File to write benchmark results")
-    parser.add_argument("--binary", default="./a.out", help="Compiled benchmark binary path")
+    parser.add_argument(
+        "--source", default="slowest.cc", help="C++ source file to compile"
+    )
+    parser.add_argument(
+        "--output", default="result.txt", help="File to write benchmark results"
+    )
+    parser.add_argument(
+        "--binary", default="./a.out", help="Compiled benchmark binary path"
+    )
     parser.add_argument("--cxx", default="g++", help="C++ compiler")
     parser.add_argument("--cpu", default="3", help="CPU core for taskset")
     parser.add_argument("--start", type=int, default=1, help="First stride value")
-    parser.add_argument("--end", type=int, default=100, help="Last stride value, inclusive")
+    parser.add_argument(
+        "--end", type=int, default=100, help="Last stride value, inclusive"
+    )
     parser.add_argument("--runs", type=int, default=5, help="Full stride sweeps to run")
     return parser.parse_args()
 
@@ -56,6 +64,7 @@ def main():
                     args.cxx,
                     "-O3",
                     "-march=native",
+                    "-std=c++2a",
                     f"-DSTRIDE={stride}",
                     str(source),
                     "-o",

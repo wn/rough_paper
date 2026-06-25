@@ -6,6 +6,7 @@ import os
 import re
 from collections import defaultdict
 from pathlib import Path
+from statistics import median
 
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(".matplotlib-cache")))
@@ -19,7 +20,7 @@ from matplotlib.ticker import FuncFormatter
 
 LINE_RE = re.compile(
     r"run=(?P<run>\d+)\s+stride=(?P<stride>\d+)\s+"
-    r"separated_by_stride_pages_and_cacheline_cycles:\s*(?P<cycles>\d+)"
+    r"separated_by_stride_pages_and_cacheline<STRIDE>_cycles:\s*(?P<cycles>\d+)"
 )
 
 
@@ -41,8 +42,8 @@ def parse_runs(path):
     return runs_by_stride, ignored
 
 
-def max_cycles_by_stride(runs_by_stride, runs_per_stride):
-    max_cycles = {}
+def median_cycles_by_stride(runs_by_stride, runs_per_stride):
+    median_cycles = {}
     incomplete = {}
 
     for stride, cycles in sorted(runs_by_stride.items()):
@@ -50,20 +51,20 @@ def max_cycles_by_stride(runs_by_stride, runs_per_stride):
             incomplete[stride] = len(cycles)
             continue
 
-        max_cycles[stride] = max(cycles[:runs_per_stride])
+        median_cycles[stride] = median(cycles[:runs_per_stride])
 
-    return max_cycles, incomplete
+    return median_cycles, incomplete
 
 
-def plot_max_cycles(max_cycles, output_path):
-    strides = list(max_cycles)
-    cycles = [max_cycles[stride] for stride in strides]
+def plot_median_cycles(median_cycles, output_path):
+    strides = list(median_cycles)
+    cycles = [median_cycles[stride] for stride in strides]
 
     fig, ax = plt.subplots(figsize=(11, 6), dpi=160)
     ax.plot(strides, cycles, marker="o", linewidth=1.8, markersize=4)
     ax.set_xlabel("Stride")
-    ax.set_ylabel("Max cycles (billions)")
-    ax.set_title("Max Cycles by Stride")
+    ax.set_ylabel("Median cycles (billions)")
+    ax.set_title("Median Cycles by Stride")
     ax.grid(True, alpha=0.3)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value / 1e9:.1f}"))
     fig.tight_layout()
@@ -213,7 +214,7 @@ def coordinate_overlay_svg(metadata):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot max cycle counts by stride from benchmark output."
+        description="Plot median cycle counts by stride from benchmark output."
     )
     parser.add_argument("input", nargs="?", type=Path, default=Path("result.txt"))
     parser.add_argument("output", nargs="?", type=Path, default=Path("graph.svg"))
@@ -221,19 +222,19 @@ def main():
         "--runs",
         type=int,
         default=5,
-        help="number of runs per stride required before taking the max",
+        help="number of runs per stride required before taking the median",
     )
     args = parser.parse_args()
 
     runs_by_stride, ignored = parse_runs(args.input)
-    max_cycles, incomplete = max_cycles_by_stride(runs_by_stride, args.runs)
+    median_cycles, incomplete = median_cycles_by_stride(runs_by_stride, args.runs)
 
-    if not max_cycles:
+    if not median_cycles:
         raise SystemExit(f"No strides with at least {args.runs} runs found in {args.input}")
 
-    interactive = plot_max_cycles(max_cycles, args.output)
+    interactive = plot_median_cycles(median_cycles, args.output)
 
-    print(f"Wrote {args.output} using {len(max_cycles)} complete stride groups.")
+    print(f"Wrote {args.output} using {len(median_cycles)} complete stride groups.")
     if interactive:
         print("Open the SVG directly in a browser for mouse coordinate readout.")
     else:
