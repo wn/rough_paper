@@ -113,7 +113,7 @@ def coordinate_overlay_svg(metadata):
     width = right - left
     height = bottom - top
     readout_x = left + 8
-    readout_y = top + 8
+    readout_y = bottom - 30
     text_y = readout_y + 15
     data_json = json.dumps(metadata)
 

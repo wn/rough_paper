@@ -27,11 +27,12 @@ constexpr int CACHELINE_SIZE = 64;
 constexpr int ELEMENT_COUNT = (1 << 16) * (PAGE_SIZE / sizeof(uint32_t));
 
 // Assumed DRAM config
-constexpr size_t skip = 4096;  // emprically tested between 512 to 8192
 constexpr uint32_t DRAM_BANK_GROUP_COUNT = 4;
 constexpr uint32_t DRAM_BANK_COUNT_PER_GROUP = 4;
-constexpr uint32_t DRAM_ROW_SHIFT = 16;  // emprically tested between 15 to 19
-constexpr int PAGE_STRIDE = 8;           // pin to 8 because graph say 8 is best
+constexpr uint32_t DRAM_ROW_SHIFT = 18;  // emprically tested between 15 to 19
+
+// emprically tested between 512 to 8192, used for my shit round robin.
+constexpr size_t skip = 4096;
 
 uint64_t rdtsc_start() {
     uint32_t lo;
@@ -108,7 +109,7 @@ void reset(uint32_t const*, uint32_t* positions) {
     }
 }
 
-void linear(uint32_t const*, uint32_t* positions) {
+void linear(uint32_t const* data, uint32_t* positions) {
     for (uint32_t i = 0; i < ELEMENT_COUNT; ++i) {
         positions[i] = i;
     }
@@ -309,9 +310,9 @@ DramLocation physical_address_to_dram_location(uint64_t physical_address,
     uint64_t ba = ba1 * 2 + ba0;
 
     return {
-        .bank_index = bg * 4 + ba,
-        .rank = 0,
-        .channel = 0,
+        .bank_index = bg * DRAM_BANK_COUNT_PER_GROUP + ba,
+        .rank = 0,     // assume rank is 0
+        .channel = 0,  // assume we only have 1 channel
         .row_index = physical_address >> DRAM_ROW_SHIFT,
         .page_index = page_index,
     };
@@ -322,20 +323,21 @@ DramLocation physical_address_to_dram_location(uint64_t physical_address,
 // within each bank_index, round-robin the rows
 
 // map each page in data to DramLocation, and bucketize them into the stride
-// that they are in (all (page_index % 8) are in same bucket).
-std::array<std::vector<DramLocation>, PAGE_STRIDE> bucketize_pages_from_stride(
-    uint32_t const* data) {
+// that they are in (all (page_index % PAGE_STRIDE) are in same bucket).
+template <int PAGE_STRIDE>
+auto bucketize_pages_from_stride(uint32_t const* data)
+    -> std::array<std::vector<DramLocation>, PAGE_STRIDE> {
     std::array<std::vector<DramLocation>, PAGE_STRIDE> result;
     constexpr int elements_per_page = PAGE_SIZE / sizeof(uint32_t);
     constexpr int page_count = ELEMENT_COUNT / elements_per_page;
 
     static_assert(ELEMENT_COUNT % elements_per_page == 0);
-    static_assert((page_count % PAGE_STRIDE) == 0);
+    static_assert(PAGE_STRIDE > 0);
 
     for (int page_stride_index = 0; page_stride_index < PAGE_STRIDE;
          ++page_stride_index) {
-        for (int i = 0; i < (page_count / PAGE_STRIDE); ++i) {
-            uint32_t page_index = i * PAGE_STRIDE + page_stride_index;
+        for (int page_index = page_stride_index; page_index < page_count;
+             page_index += PAGE_STRIDE) {
             DramLocation dram_location = physical_address_to_dram_location(
                 physical_address(reinterpret_cast<uintptr_t>(
                     data + page_index * elements_per_page)),
@@ -379,15 +381,15 @@ void round_robin_row_bucket(std::vector<DramLocation>& data_from_same_bank) {
     data_from_same_bank = std::move(result);
 }
 
-std::vector<uint32_t> build_stride8_bank_conflict_physical_page_order(
+template <int PAGE_STRIDE>
+std::vector<uint32_t> build_stride_bank_conflict_physical_page_order(
     uint32_t const* data) {
-    // TODO don't hardcode 16
     std::vector<uint32_t> result;
     constexpr int elements_per_page = PAGE_SIZE / sizeof(uint32_t);
     constexpr int page_count = ELEMENT_COUNT / elements_per_page;
     result.reserve(page_count);
     std::array<std::vector<DramLocation>, PAGE_STRIDE> buckets =
-        bucketize_pages_from_stride(data);
+        bucketize_pages_from_stride<PAGE_STRIDE>(data);
     for (int stride = 0; stride < PAGE_STRIDE; ++stride) {
         std::array<std::vector<DramLocation>, DRAM_BANK_COUNT>
             bank_index_buckets = bucket_into_bank_index(buckets[stride]);
@@ -402,18 +404,22 @@ std::vector<uint32_t> build_stride8_bank_conflict_physical_page_order(
 }
 }  // namespace ram_code
 
-void separated_by_stride8_bank_conflicts_and_cacheline(uint32_t const* data,
-                                                       uint32_t* positions) {
+template <int PAGE_STRIDE>
+void separated_by_stride_bank_conflicts_and_cacheline(uint32_t const* data,
+                                                      uint32_t* positions) {
     constexpr int elements_per_cacheline = CACHELINE_SIZE / sizeof(uint32_t);
     constexpr int elements_per_page = PAGE_SIZE / sizeof(uint32_t);
     constexpr int cacheline_per_page = PAGE_SIZE / CACHELINE_SIZE;
 
     static_assert(ELEMENT_COUNT % elements_per_page == 0);
 
+    // get the ordering of which pages to access.
     std::vector<uint32_t> page_order =
-        ram_code::build_stride8_bank_conflict_physical_page_order(data);
+        ram_code::build_stride_bank_conflict_physical_page_order<PAGE_STRIDE>(
+            data);
     assert(page_order.size() == ELEMENT_COUNT / elements_per_page);
 
+    // within each page, determine how to access positions.
     int current = 0;
     for (int element_index_in_cacheline = 0;
          element_index_in_cacheline < elements_per_cacheline;
@@ -434,16 +440,16 @@ void separated_by_stride8_bank_conflicts_and_cacheline(uint32_t const* data,
 
 // call linear at start to reset positions - some arrangements (eg shuffle)
 // might rely on this.
-#define BENCHMARK_ACCESS_PATTERN(arrange_positions)               \
-    do {                                                          \
-        reset(data, positions);                                   \
-        arrange_positions(data, positions);                       \
-        uint64_t start = rdtsc_start();                           \
-        uint32_t sum = accumulator(data, positions);              \
-        uint64_t end = rdtsc_end();                               \
-        print_cycles(#arrange_positions "_cycles:", end - start); \
-        assert(sum == linear_scan_sum);                           \
-        do_not_optimize(sum);                                     \
+#define BENCHMARK_ACCESS_PATTERN(arrange_positions)    \
+    do {                                               \
+        reset(data, positions);                        \
+        arrange_positions(data, positions);            \
+        uint64_t start = rdtsc_start();                \
+        uint32_t sum = accumulator(data, positions);   \
+        uint64_t end = rdtsc_end();                    \
+        print_cycles(#arrange_positions, end - start); \
+        assert(sum == linear_scan_sum);                \
+        do_not_optimize(sum);                          \
     } while (0)
 
 int main() {
@@ -468,9 +474,10 @@ int main() {
     BENCHMARK_ACCESS_PATTERN(separated_by_a_cacheline);
     BENCHMARK_ACCESS_PATTERN(separated_by_a_page);
     BENCHMARK_ACCESS_PATTERN(separated_by_a_page_and_cacheline);
-    printf("stride used=%d ", STRIDE);
+    printf("stride=%d ", STRIDE);
     BENCHMARK_ACCESS_PATTERN(separated_by_stride_pages_and_cacheline<STRIDE>);
-    BENCHMARK_ACCESS_PATTERN(separated_by_stride8_bank_conflicts_and_cacheline);
+    BENCHMARK_ACCESS_PATTERN(
+        separated_by_stride_bank_conflicts_and_cacheline<STRIDE>);
 
     free(data);
     free(positions);
